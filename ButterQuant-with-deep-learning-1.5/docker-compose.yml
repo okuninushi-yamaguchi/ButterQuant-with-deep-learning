@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  # ==================== Redis 缓存 ====================
+  redis:
+    image: redis:7-alpine
+    container_name: butterquant_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ==================== TimescaleDB (PostgreSQL) ====================
+  timescale:
+    image: timescale/timescaledb:latest-pg15
+    container_name: butterquant_timescale
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=butterquant
+      - POSTGRES_PASSWORD=butterquant_pass
+      - POSTGRES_USER=postgres
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./backend/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d butterquant"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==================== Flask 后端 ====================
+  backend:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: butterquant_backend
+    ports:
+      - "5000:5000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DB_HOST=timescale
+      - DB_PORT=5432
+      - DB_NAME=butterquant
+      - DB_USER=postgres
+      - DB_PASSWORD=butterquant_pass
+      - CACHE_TTL=300  # 5分钟缓存
+      - WORKERS=4      # Gunicorn worker 数量
+    volumes:
+      - ./backend:/app
+      - ./backend/data:/app/data  # 挂载数据库目录
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescale:
+        condition: service_healthy
+    restart: unless-stopped
+    command: >
+      gunicorn 
+      --bind 0.0.0.0:5000 
+      --workers 4 
+      --worker-class gevent 
+      --worker-connections 1000 
+      --timeout 120 
+      --access-logfile - 
+      --error-logfile - 
+      app:app
+
+volumes:
+  redis_data:
+    driver: local
+  timescale_data:
+    driver: local
+
+networks:
+  default:
+    name: butterquant_network

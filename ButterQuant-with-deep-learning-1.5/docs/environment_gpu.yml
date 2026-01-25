@@ -1,0 +1,30 @@
+name: butterquant_gpu
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1 # 对应您的 RTX 4060
+  - pandas
+  - numpy
+  - scikit-learn
+  - yfinance
+  - joblib
+  - onnxruntime-gpu
+  - pip
+  - pip:
+      - ib_insync
+      - nest_asyncio
+      - flask
+      - flask-cors
+      - arch
+      - statsmodels
+      - PyYAML
+      - psycopg2-binary
+      - redis
+      - gevent

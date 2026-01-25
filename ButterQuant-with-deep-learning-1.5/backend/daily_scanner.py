@@ -1,0 +1,231 @@
+# -*- coding: utf-8 -*-
+"""
+Daily Scanner - 每日批量扫描脚本 / Daily Batch Scanning Script
+独立运行，不依赖Flask Context，但使用相同的Analyzer逻辑 / Runs independently, doesn't depend on Flask Context, but uses same Analyzer logic
+"""
+
+import os
+import sys
+import json
+import yaml
+import time
+import math
+import logging
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# 添加backend路径到sys.path以便导入模块 / Add backend path to sys.path for module imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from backend.analyzer import ButterflyAnalyzer
+from backend.database import DatabaseManager
+from backend.ticker_utils import merge_ticker_lists, get_tickers_with_tags
+
+# 加载配置 / Load configuration
+def load_config():
+    config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
+    if os.path.exists(config_path):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    return {}
+
+config = load_config()
+
+# 配置日志 / Configure logging
+backend_dir = os.path.dirname(os.path.abspath(__file__))
+log_dir_raw = config.get('paths', {}).get('log_dir', 'logs')
+if os.path.isabs(log_dir_raw):
+    log_dir = log_dir_raw
+else:
+    log_dir = os.path.join(backend_dir, log_dir_raw)
+
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+logging.basicConfig(
+    filename=os.path.join(log_dir, 'scanner.log'),
+    level=getattr(logging, config.get('log', {}).get('level', 'INFO')),
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logging.getLogger('').addHandler(console)
+
+class DailyScanner:
+    def __init__(self):
+        self.config = config
+        
+        # 获取 backend 根目录 (脚本所在目录) / Get backend root directory
+        self.backend_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # 统一处理路径解析 / Uniformly handle path resolution
+        def get_abs_path(rel_path, default_rel):
+            path = rel_path if rel_path else default_rel
+            if os.path.isabs(path):
+                return path
+            return os.path.join(self.backend_dir, path)
+
+        db_path_raw = config.get('paths', {}).get('db_path')
+        db_path = get_abs_path(db_path_raw, 'data/history.db')
+        
+        deep_db_path_raw = config.get('paths', {}).get('deep_db_path')
+        deep_db_path = get_abs_path(deep_db_path_raw, 'data/market_research.db')
+        
+        # 初始化统一的数据库管理器 / Initialize unified database manager
+        self.db = DatabaseManager(db_path, deep_db_path)
+        
+        data_dir_raw = config.get('paths', {}).get('data_dir', 'data')
+        self.data_dir = get_abs_path(data_dir_raw, 'data')
+        
+        self.progress_file = os.path.join(self.data_dir, config.get('storage', {}).get('progress_file', 'scan_progress.txt'))
+        
+        if not os.path.exists(self.data_dir):
+            os.makedirs(self.data_dir)
+
+    def load_tickers_with_info(self):
+        """加载所有待扫描的Ticker和标签 / Load all tickers and tags to be scanned"""
+        ticker_files = config.get('paths', {}).get('ticker_files', [])
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        
+        file_map = {}
+        for f in ticker_files:
+            abs_path = os.path.join(base_dir, f)
+            tag = 'UNKNOWN'
+            if 'nas' in f.lower():
+                tag = 'NASDAQ'
+            elif 'sp500' in f.lower():
+                tag = 'SP500'
+            file_map[tag] = abs_path
+            
+        ticker_tags = get_tickers_with_tags(file_map)
+        logging.info(f"Loaded {len(ticker_tags)} unique tickers with tags. / Loaded {len(ticker_tags)} tickers")
+        return ticker_tags
+
+    def analyze_ticker(self, ticker, tags):
+        """分析单个Ticker / Analyze a single ticker"""
+        try:
+            logging.info(f"Analyzing {ticker}... / Analyzing...")
+            analyzer = ButterflyAnalyzer(ticker)
+            result = analyzer.full_analysis()
+            
+            # 简单的验证
+            if result and 'score' in result:
+                result['tags'] = tags  # 添加标签
+                return result
+            else:
+                logging.warning(f"Analysis for {ticker} returned empty result.")
+                return None
+                
+        except Exception as e:
+            logging.error(f"Error analyzing {ticker}: {str(e)}")
+            return None
+
+    def save_results_to_json(self, results):
+        """保存结果到JSON文件 / Save results to JSON file"""
+        if not results:
+            return
+            
+        # 按分数排序 / Sort by score
+        sorted_results = sorted(results, key=lambda x: x['score']['total'], reverse=True)
+        
+        # 简化版结果用于列表显示 / Simplified results for list display
+        simplified_results = []
+        for r in sorted_results:
+            simplified_results.append({
+                'rank': 0, # 这里暂时占位 / Placeholder
+                'ticker': r['ticker'],
+                'score': r['score']['total'],
+                'strategy': r['fourier']['butterfly_type'],
+                'recommendation': r['trade_suggestion']['action'],
+                'confidence': r['score'].get('confidence_level', 'UNKNOWN'),
+                'ml_success_prob': r['score'].get('ml_success_prob', 0),
+                'ml_expected_roi': r['score'].get('ml_expected_roi', 0),
+                'date': r['analysis_date'],
+                'expiry': r['butterfly'].get('expiry', 'N/A'),
+                'lower': r['butterfly'].get('lower_strike', 0),
+                'center': r['butterfly'].get('center_strike', 0),
+                'upper': r['butterfly'].get('upper_strike', 0),
+                'is_credit_strategy': r['butterfly'].get('is_credit_strategy', False),
+                'tags': r.get('tags', [])
+            })
+            
+        # 添加排名 / Add ranking
+        for i, r in enumerate(simplified_results):
+            r['rank'] = i + 1
+            
+        # 净化数据 (处理 NaN) / Sanitize data (handle NaN)
+        def sanitize(data):
+            if isinstance(data, dict):
+                return {k: sanitize(v) for k, v in data.items()}
+            elif isinstance(data, list):
+                return [sanitize(v) for v in data]
+            elif isinstance(data, float):
+                if math.isnan(data) or math.isinf(data):
+                    return None
+            return data
+            
+        clean_results = sanitize(simplified_results)
+            
+        # 保存完整榜单 / Save full list
+        full_path = os.path.join(self.data_dir, config.get('storage', {}).get('ranking_file', 'rankings_combined.json'))
+        with open(full_path, 'w', encoding='utf-8') as f:
+            json.dump(clean_results, f, indent=2, ensure_ascii=False)
+            
+        # 保存Top 20 / Save Top 20
+        top20_path = os.path.join(self.data_dir, config.get('storage', {}).get('top20_file', 'rankings_top20.json'))
+        with open(top20_path, 'w', encoding='utf-8') as f:
+            json.dump(clean_results[:20], f, indent=2, ensure_ascii=False)
+            
+        logging.info(f"Saved rankings to {full_path} and {top20_path}")
+
+    def run(self):
+        """运行完整扫描流程 / Run full scanning process"""
+        start_time = datetime.now()
+        logging.info("Starting Daily Scan... / Starting...")
+        
+        ticker_tags = self.load_tickers_with_info()
+        tickers = list(ticker_tags.keys())
+        
+        analyzed_count = 0
+        success_count = 0
+        results = []
+        
+        max_workers = config.get('scanner', {}).get('max_workers', 4)
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_ticker = {executor.submit(self.analyze_ticker, t, ticker_tags[t]): t for t in tickers}
+            
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                analyzed_count += 1
+                try:
+                    data = future.result()
+                    if data:
+                        results.append(data)
+                        success_count += 1
+                        
+                        # 保存到常规历史数据库 (JSON Blob) / Save to regular history database
+                        if config.get('storage', {}).get('save_db', True):
+                            self.db.save_analysis(data)
+
+                        # 保存到深度分析数据库 (Flattened Rows - AI Ready) / Save to deep analysis database
+                        # 使用优化后的 DatabaseManager / Use optimized DatabaseManager
+                        self.db.save_daily_metrics(ticker, data)
+                            
+                except Exception as e:
+                    logging.error(f"Worker exception for {ticker}: {e}")
+                    
+                # 打印进度 / Print progress
+                if analyzed_count % 5 == 0:
+                    logging.info(f"Progress: {analyzed_count}/{len(tickers)} ({success_count} success) / Progress...")
+
+        # 保存JSON缓存 / Save JSON cache
+        if config.get('storage', {}).get('save_json', True):
+            self.save_results_to_json(results)
+            
+        duration = datetime.now() - start_time
+        logging.info(f"Scan completed in {duration}. Total: {len(tickers)}, Success: {success_count}")
+
+if __name__ == "__main__":
+    scanner = DailyScanner()
+    scanner.run()
